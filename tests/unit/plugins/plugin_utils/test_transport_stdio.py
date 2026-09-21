@@ -13,9 +13,10 @@ import json
 import pathlib
 import random
 import string
+import time
 
 from subprocess import TimeoutExpired
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -257,17 +258,123 @@ def test_request_or_notify_success(mock_process, is_request):
     stdio._process = mock_process
     stdio._stdin_write = MagicMock()
     stdio._stdin_write.return_value = None
-    stdout_value = MagicMock()
+    stdout_value = {"jsonrpc": "2.0", "id": 1, "result": {}}
     stdio._stdout_read = MagicMock()
     stdio._stdout_read.return_value = stdout_value
 
-    data = MagicMock()
+    data = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
     if not is_request:
         stdio.notify(data)
     else:
         assert stdio.request(data) == stdout_value
-        stdio._stdout_read.assert_called_once_with()
+        stdio._stdout_read.assert_called_once_with(timeout=ANY)
     stdio._stdin_write.assert_called_once_with(data)
+
+
+def test_request_skips_notifications(mock_process):
+    """Notifications sent before the response must not be returned."""
+
+    mock_process.poll.return_value = None
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    stdio._stdin_write = MagicMock()
+    expected = {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}
+    stdio._stdout_read = MagicMock(
+        side_effect=[
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/resources/list_changed", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/prompts/list_changed", "params": {}},
+            expected,
+        ]
+    )
+
+    assert stdio.request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) == expected
+    assert stdio._stdout_read.call_count == 4
+
+
+def test_request_skips_mismatched_id(mock_process):
+    """A response to an earlier request must not be returned."""
+
+    mock_process.poll.return_value = None
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    stdio._stdin_write = MagicMock()
+    expected = {"jsonrpc": "2.0", "id": 7, "result": {"ok": True}}
+    stdio._stdout_read = MagicMock(
+        side_effect=[
+            {"jsonrpc": "2.0", "id": 6, "result": {"stale": True}},
+            expected,
+        ]
+    )
+
+    assert stdio.request({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}) == expected
+
+
+def test_request_returns_error_response_for_matching_id(mock_process):
+    """A JSON-RPC error carries an id and must be returned, not skipped."""
+
+    mock_process.poll.return_value = None
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    stdio._stdin_write = MagicMock()
+    expected = {"jsonrpc": "2.0", "id": 3, "error": {"code": -32601, "message": "not found"}}
+    stdio._stdout_read = MagicMock(side_effect=[expected])
+
+    assert stdio.request({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}) == expected
+
+
+@patch("os.read")
+@patch("select.select")
+def test_stdout_read_buffers_extra_messages(mock_select, mock_os_read, mock_process):
+    """Messages batched into a single read are not discarded."""
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    mock_stdout = MagicMock()
+    mock_process.stdout = mock_stdout
+    mock_select.return_value = [mock_stdout], [], []
+    mock_os_read.return_value = b'{"id": 1}\n{"id": 2}\n'
+
+    assert stdio._stdout_read() == {"id": 1}
+    assert stdio._stdout_read() == {"id": 2}
+    # The second message came out of the buffer, not a second read.
+    mock_os_read.assert_called_once()
+
+
+@patch("os.read")
+@patch("select.select")
+def test_stdout_read_skips_non_json_line(mock_select, mock_os_read, mock_process):
+    """Non JSON-RPC output must not discard messages buffered behind it."""
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    mock_stdout = MagicMock()
+    mock_process.stdout = mock_stdout
+    mock_select.return_value = [mock_stdout], [], []
+    mock_os_read.return_value = b'server log line\n{"id": 1}\n'
+
+    assert stdio._stdout_read() == {"id": 1}
+    mock_os_read.assert_called_once()
+
+
+@patch("os.read")
+@patch("select.select")
+def test_stdout_read_detects_closed_stream(mock_select, mock_os_read, mock_process):
+    """EOF on stdout is reported instead of spinning until the timeout."""
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    mock_stdout = MagicMock()
+    mock_process.stdout = mock_stdout
+    mock_select.return_value = [mock_stdout], [], []
+    mock_os_read.return_value = b""
+
+    with pytest.raises(AnsibleConnectionFailure) as exc_info:
+        stdio._stdout_read()
+    assert "closed its output stream" in str(exc_info.value)
 
 
 def test_with_mcp_server():
@@ -298,6 +405,18 @@ def test_with_mcp_server():
     date = stdio.request(dict(method="date"))
     assert date["date"].startswith("The date of today is")
 
+    # notifications sent ahead of the response are skipped
+    response = stdio.request(dict(method="notify_then_respond", id=10, count=3))
+    assert response == dict(jsonrpc="2.0", id=10, result=dict(ok=True))
+
+    # a response to an earlier request is skipped
+    response = stdio.request(dict(method="stale_then_respond", id=11))
+    assert response == dict(jsonrpc="2.0", id=11, result=dict(ok=True))
+
+    # non JSON-RPC output on stdout is skipped
+    response = stdio.request(dict(method="noise_then_respond", id=12))
+    assert response == dict(jsonrpc="2.0", id=12, result=dict(ok=True))
+
     # request timeout
     with pytest.raises(AnsibleConnectionFailure) as exc_info:
         response = stdio.request(dict(method="timeout", value=6))
@@ -305,4 +424,23 @@ def test_with_mcp_server():
     assert "MCP server response timeout after" in str(exc_info.value)
 
     # terminate mcp server
+    stdio.close()
+
+
+def test_with_mcp_server_notification_flood():
+    """A server that only ever sends notifications must time out, not hang."""
+
+    mcp_server_command = pathlib.Path(__file__).parent.joinpath("mcp_server.py")
+
+    stdio = Stdio(cmd=[str(mcp_server_command.resolve())], command_timeout=2)
+    stdio.connect()
+
+    started = time.monotonic()
+    with pytest.raises(AnsibleConnectionFailure) as exc_info:
+        stdio.request(dict(method="flood", id=1))
+    elapsed = time.monotonic() - started
+
+    assert "MCP server response timeout after" in str(exc_info.value)
+    assert elapsed < 10
+
     stdio.close()

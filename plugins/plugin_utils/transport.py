@@ -76,6 +76,9 @@ class Stdio(Transport):
         self._env = env
         self._process: Optional[Any] = None
         self._command_timeout = command_timeout
+        # stdout is read in chunks, so a single read can return several
+        # messages at once. Keep the leftovers for the next read.
+        self._stdout_buffer = b""
 
     def connect(self) -> None:
         """Spawn a local MCP server subprocess."""
@@ -117,27 +120,49 @@ class Stdio(Transport):
         except Exception as e:
             raise AnsibleConnectionFailure(f"Failed to start MCP server: {str(e)}")
 
-    def _stdout_read(self) -> dict:
-        """Read response from MCP server with timeout.
+    def _stdout_read(self, timeout: Optional[float] = None) -> dict:
+        """Read a single message from the MCP server with timeout.
+
+        Args:
+            timeout: Seconds to wait for a complete message. Defaults to the
+                configured command timeout.
 
         Returns:
-            A JSON-RPC response dictionary from the MCP server.
+            A JSON-RPC message dictionary from the MCP server.
         """
 
-        response = {}
-        buffer = b""
+        response: dict = {}
+        if timeout is None:
+            timeout = self._command_timeout
+
         if self._process:
+            deadline = time.monotonic() + timeout
             while True:
-                rfd, wfd, efd = select.select([self._process.stdout], [], [], self._command_timeout)
+                # An earlier read may have buffered more than one message.
+                if b"\n" in self._stdout_buffer:
+                    line, self._stdout_buffer = self._stdout_buffer.split(b"\n", 1)
+                    try:
+                        response = json.loads(line.decode("utf-8"))
+                        break
+                    except Exception:
+                        # Discard the unparsable line only, so that any message
+                        # already buffered behind it is still read.
+                        continue
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AnsibleConnectionFailure(
+                        f"MCP server response timeout after {self._command_timeout} seconds."
+                    )
+
+                rfd, wfd, efd = select.select([self._process.stdout], [], [], remaining)
                 if self._process.stdout in rfd:
-                    buffer += os.read(self._process.stdout.fileno(), 4096)
-                    if b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        try:
-                            response = json.loads(line.decode("utf-8"))
-                            break
-                        except Exception:
-                            buffer = b""
+                    chunk = os.read(self._process.stdout.fileno(), 4096)
+                    if not chunk:
+                        raise AnsibleConnectionFailure(
+                            "MCP server closed its output stream before sending a response."
+                        )
+                    self._stdout_buffer += chunk
                 else:
                     # Process has timeout
                     raise AnsibleConnectionFailure(
@@ -193,10 +218,16 @@ class Stdio(Transport):
 
         This sends a JSON-RPC payload to the server when a response is expected.
 
+        A server may send notifications at any time, including between the
+        request and its response, so messages are read until the one carrying
+        the request ``id`` is found. The whole exchange is bounded by the
+        command timeout so that a chatty server cannot block the caller
+        indefinitely.
+
         Args:
             data: JSON-RPC payload.
         Returns:
-            The JSON-RPC response from the server.
+            The JSON-RPC response matching the ``id`` of the request.
         """
         try:
             # Send request to the server
@@ -204,9 +235,16 @@ class Stdio(Transport):
         except Exception as e:
             raise AnsibleConnectionFailure(f"Error sending request to MCP server: {str(e)}")
 
+        request_id = data.get("id")
+        deadline = time.monotonic() + self._command_timeout
+
         try:
-            # Read response
-            return self._stdout_read()
+            while True:
+                message = self._stdout_read(timeout=max(deadline - time.monotonic(), 0))
+                # Notifications carry no id, and a response to an earlier
+                # request carries a different one. Neither is this reply.
+                if message.get("id") == request_id:
+                    return message
         except Exception as e:
             raise AnsibleConnectionFailure(f"Error reading server response: {str(e)}")
 
@@ -227,6 +265,7 @@ class Stdio(Transport):
                 raise AnsibleConnectionFailure(f"Error closing MCP process: {str(e)}")
             finally:
                 self._process = None
+                self._stdout_buffer = b""
 
 
 class StreamableHTTP(Transport):
