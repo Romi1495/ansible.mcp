@@ -9,13 +9,16 @@ bugfixes:
     no ``result`` field ``tools_info`` failed with ``Failed to list tools -
     Error in list tools`` on the first call against such a server. The whole
     exchange stays bounded by ``persistent_command_timeout`` so that a server
-    which only sends notifications times out rather than looping forever.
+    which only sends notifications times out rather than looping forever
+    (https://github.com/ansible-collections/ansible.mcp/pull/85).
   - >-
     stdio transport - Keep unread stdout bytes buffered between reads. Messages
     that arrived in the same chunk as a preceding message were discarded, which
     dropped the response whenever a server wrote its notifications and its
-    response together.
+    response together
+    (https://github.com/ansible-collections/ansible.mcp/pull/85).
   - >-
     stdio transport - Skip only the offending line when stdout contains output
     that is not valid JSON, rather than discarding everything buffered behind
-    it, and report end-of-file on stdout instead of waiting for the timeout.
+    it, and report end-of-file on stdout instead of waiting for the timeout
+    (https://github.com/ansible-collections/ansible.mcp/pull/85).
