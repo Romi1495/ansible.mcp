@@ -33,20 +33,14 @@ for line in sys.stdin:
     if method == "notify":
         notifications += 1
     elif method == "read_notifications":
-        result = json.dumps(dict(notifications=notifications)) + "\n"
-        sys.stdout.write(result)
-        sys.stdout.flush()
+        write(dict(id=data.get("id"), notifications=notifications))
     elif method == "hello":
         name = data.get("name")
         server_name = os.environ.get("MCP_SERVER_NAME")
-        result = json.dumps(dict(message=f"Hello {name} from {server_name}.")) + "\n"
-        sys.stdout.write(result)
-        sys.stdout.flush()
+        write(dict(id=data.get("id"), message=f"Hello {name} from {server_name}."))
     elif method == "date":
         today = datetime.datetime.now().strftime("%d%m%Y")
-        result = json.dumps(dict(date=f"The date of today is {today}")) + "\n"
-        sys.stdout.write(result)
-        sys.stdout.flush()
+        write(dict(id=data.get("id"), date=f"The date of today is {today}"))
     elif method == "timeout":
         value = data.get("value")
         time.sleep(int(value) + 3)

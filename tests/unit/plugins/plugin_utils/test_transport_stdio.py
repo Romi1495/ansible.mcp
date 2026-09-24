@@ -326,6 +326,44 @@ def test_request_returns_error_response_for_matching_id(mock_process):
     assert stdio.request({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}) == expected
 
 
+def test_request_without_id_is_rejected(mock_process):
+    """A payload with no id is a notification, and would match the first one read."""
+
+    mock_process.poll.return_value = None
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._process = mock_process
+    stdio._stdin_write = MagicMock()
+    # Without the guard this notification carries id None too, compares equal to
+    # the request id and is handed back as if it were the response.
+    stdio._stdout_read = MagicMock(
+        side_effect=[{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}]
+    )
+
+    with pytest.raises(AnsibleConnectionFailure) as exc_info:
+        stdio.request({"jsonrpc": "2.0", "method": "tools/list"})
+
+    assert "must include an 'id'" in str(exc_info.value)
+    # Nothing is sent, so the server is not left with an unanswerable request.
+    stdio._stdin_write.assert_not_called()
+    stdio._stdout_read.assert_not_called()
+
+
+@patch("subprocess.Popen")
+def test_connect_resets_stdout_buffer(m_popen, mock_process):
+    """Bytes from a dead process must not leak into its replacement."""
+
+    mock_process.poll.return_value = None
+    m_popen.return_value = mock_process
+
+    stdio = Stdio(cmd=MagicMock())
+    stdio._stdout_buffer = b'{"id": 1, "result": "stale"}\n'
+
+    stdio.connect()
+
+    assert stdio._stdout_buffer == b""
+
+
 @patch("os.read")
 @patch("select.select")
 def test_stdout_read_buffers_extra_messages(mock_select, mock_os_read, mock_process):
@@ -395,14 +433,14 @@ def test_with_mcp_server():
     for i in range(number_notifications):
         stdio.notify(dict(method="notify"))
 
-    notifications = stdio.request(dict(method="read_notifications"))
+    notifications = stdio.request(dict(method="read_notifications", id=1))
     assert notifications["notifications"] == number_notifications
 
     # Validate requests
-    hello = stdio.request(dict(method="hello", name="ansible"))
+    hello = stdio.request(dict(method="hello", name="ansible", id=2))
     assert hello["message"] == f"Hello ansible from {mcp_server_name}."
 
-    date = stdio.request(dict(method="date"))
+    date = stdio.request(dict(method="date", id=3))
     assert date["date"].startswith("The date of today is")
 
     # notifications sent ahead of the response are skipped
@@ -419,7 +457,7 @@ def test_with_mcp_server():
 
     # request timeout
     with pytest.raises(AnsibleConnectionFailure) as exc_info:
-        response = stdio.request(dict(method="timeout", value=6))
+        response = stdio.request(dict(method="timeout", value=6, id=13))
         print(f"Response => {response}")
     assert "MCP server response timeout after" in str(exc_info.value)
 

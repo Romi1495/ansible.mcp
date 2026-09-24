@@ -82,6 +82,9 @@ class Stdio(Transport):
 
     def connect(self) -> None:
         """Spawn a local MCP server subprocess."""
+        # Bytes left over from a previous process belong to that process.
+        self._stdout_buffer = b""
+
         params: dict[str, Any] = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -225,17 +228,25 @@ class Stdio(Transport):
         indefinitely.
 
         Args:
-            data: JSON-RPC payload.
+            data: JSON-RPC payload. Must carry an ``id``.
         Returns:
             The JSON-RPC response matching the ``id`` of the request.
         """
+        request_id = data.get("id")
+        if request_id is None:
+            # Without an id there is nothing to match the response against, and
+            # every notification would compare equal to it. A payload with no id
+            # is a notification by definition; send it with notify() instead.
+            raise AnsibleConnectionFailure(
+                "JSON-RPC request passed to request() must include an 'id'."
+            )
+
         try:
             # Send request to the server
             self._stdin_write(data)
         except Exception as e:
             raise AnsibleConnectionFailure(f"Error sending request to MCP server: {str(e)}")
 
-        request_id = data.get("id")
         deadline = time.monotonic() + self._command_timeout
 
         try:
